@@ -1,0 +1,14 @@
+{
+  "name": "mister-hogs-smartpos",
+  "version": "2.0.0",
+  "description": "Mister Hogs SmartPOS — offline point of sale with a local SQLite database.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "dependencies": {},
+  "license": "UNLICENSED"
+}
