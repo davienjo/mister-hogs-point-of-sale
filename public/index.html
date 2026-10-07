@@ -608,7 +608,7 @@ function createSale(s, o) {
   const cust = o.customer && (o.customer.name || o.customer.phone) ? { name: (o.customer.name || '').trim(), phone: (o.customer.phone || '').trim() } : null;
   const sale = {
     id: uid(), no, day, at: new Date().toISOString(), source: o.source,
-    lines: lines.map((l) => ({ name: l.name, label: l.label, qty: l.qty, unit: l.unit, kind: l.kind, ch: l.ch, total: l.total, cost: l.cost || 0, deduct: l.deduct || [] })),
+    lines: lines.map((l) => ({ name: l.name, label: l.label, qty: l.qty, unit: l.unit, kind: l.kind, ch: l.ch, total: l.total, cost: l.cost || 0, deduct: l.deduct || [], spId: l.spId || null })),
     total, cogs: r2(sum(lines, (l) => l.cost || 0)),
     pay: o.pay || null, payments: o.pay && paidNow > 0 ? [mkPayment(o.pay, o.cashier)] : [],
     status: o.pay ? (paidNow >= total - 0.5 ? 'paid' : 'partial') : 'unpaid', balance: r2(Math.max(0, total - paidNow)),
@@ -641,10 +641,19 @@ function settleSaleBalance(s, saleId, pay, by) {
 // so the Debtors screen and the outstanding figure in Reports can never disagree.
 function debtors(s) {
   const list = [];
-  s.sales.filter((x) => !x.voided && x.status !== 'paid' && x.balance > 0.5 && !x.special && !x.tableNo).forEach((x) => {
+  // A settled sale always has an outstanding balance or it would not be here, and
+  // settling a table deletes its tab, so a table sale with money owing is a real
+  // debt. It used to be filtered out by a bare `!x.tableNo`, which hid it.
+  s.sales.filter((x) => !x.voided && x.status !== 'paid' && x.balance > 0.5 && !x.special).forEach((x) => {
     list.push({ kind: 'sale', id: x.id, name: (x.customer && x.customer.name) || 'Walk-in customer', phone: (x.customer && x.customer.phone) || '', ref: receiptNo(x), source: x.source === 'butchery' ? 'Butchery credit' : x.source === 'ready' ? 'Kitchen · ready-made' : 'Sale', at: x.at, day: x.day, total: x.total, paid: r2(x.total - x.balance), balance: x.balance });
   });
-  s.specials.filter((x) => !x.paid && !x.cleared && !x.tableNo && x.price - (x.paidAmount || 0) > 0.5).forEach((x) => {
+  // Every special belongs to a table now, and a special-only table never gets a
+  // tab — so "still on an open table" cannot be told apart from "settlement was
+  // voided and the tab deleted". They are the same state. Money owed is therefore
+  // always listed here rather than risk hiding it; the table bill shows the same
+  // figure, and clearing it from here just marks the order paid, which settleTab
+  // then charges as zero, so nothing is ever counted twice.
+  s.specials.filter((x) => !x.paid && !x.cleared && x.price - (x.paidAmount || 0) > 0.5).forEach((x) => {
     list.push({ kind: 'special', id: x.id, name: x.customer || 'Walk-in customer', phone: x.phone || '', ref: 'Special #' + x.no, source: 'Special order', at: x.at, day: x.day, total: x.price, paid: x.paidAmount || 0, balance: r2(x.price - (x.paidAmount || 0)) });
   });
   return list.sort((a, b) => a.at.localeCompare(b.at));
@@ -656,7 +665,18 @@ function voidSale(s, saleId, reason, by) {
   if (!reason || !reason.trim()) return 'Give a reason for the void';
   if (sale.deducted) applyDeducts(s, sale.lines.flatMap((l) => l.deduct || []), -1, sale.day);
   sale.voided = true; sale.voidReason = reason.trim(); sale.voidBy = by; sale.voidAt = new Date().toISOString();
-  if (sale.tableNo) { s.specials.filter((x) => x.saleId === sale.id).forEach((sp) => { sp.paid = false; sp.paidAmount = 0; sp.saleId = null; }); }
+  if (sale.tableNo) {
+    // Undo only what THIS settlement took from each special. It used to zero the
+    // whole paidAmount, which destroyed any deposit the customer had already
+    // handed over — they would have been asked to pay for it a second time.
+    s.specials.forEach((sp) => {
+      if (sp.saleId !== sale.id && !sale.lines.some((l) => l.spId === sp.id)) return;
+      const contrib = sum(sale.lines.filter((l) => l.spId === sp.id), (l) => l.total);
+      sp.paidAmount = Math.max(0, r2((sp.paidAmount || 0) - contrib));
+      sp.paid = sp.paidAmount >= sp.price - 0.5;
+      if (!sp.paid) sp.saleId = null;
+    });
+  }
   if (sale.special) { const sp = s.specials.find((x) => x.id === sale.special); if (sp) { sp.paidAmount = Math.max(0, r2((sp.paidAmount || 0) - (sale.total - sale.balance))); sp.paid = sp.paidAmount >= sp.price - 0.5; if (!sp.paid) sp.saleId = null; } }
   logAudit(s, 'Void sale', 'Receipt ' + receiptNo(sale) + ' · ' + money(sale.total) + ' · ' + reason.trim(), by);
   return null;
@@ -680,8 +700,12 @@ function transferToKitchen(s, meatId, qty, by, type) {
 }
 function receiveMeat(s, meatId, qty, totalCost, supplierId, method, by) {
   const m = meatOf(s, meatId);
-  if (totalCost > 0) m.cost = r2((m.stock * m.cost + totalCost) / (m.stock + qty));
-  m.stock = r3(m.stock + qty);
+  // Weighted-average cost. The denominator is guarded: a zero or negative quantity
+  // would divide by zero and store Infinity, which JSON then persists as null and
+  // silently poisons every cost, COGS and P&L figure afterwards.
+  const newStock = r3(m.stock + qty);
+  if (totalCost > 0 && newStock > 0) m.cost = r2((m.stock * m.cost + totalCost) / newStock);
+  m.stock = newStock;
   const day = dayStr();
   s.purchases.push({ id: uid(), day, at: new Date().toISOString(), kind: 'meat', itemId: m.id, name: m.name, qty, total: totalCost, supplierId: supplierId || null, method: method || 'cash', by });
   if (supplierId && method === 'credit' && totalCost > 0) { const sup = s.suppliers.find((x) => x.id === supplierId); if (sup) sup.balance = r2(sup.balance + totalCost); }
@@ -799,13 +823,31 @@ function changeTabLine(s, no, key, delta) {
 function tabLinked(s, no) { return s.specials.filter((x) => x.tableNo === no && !x.paid && !x.cleared); }
 function tabTotal(s, no) {
   const tab = s.tabs[no];
-  return sum(tab ? tab.lines : [], (l) => l.total) + sum(tabLinked(s, no), (x) => x.price);
+  // A special that already has a deposit on it only owes its balance — otherwise
+  // the deposit would be charged a second time when the table settles.
+  return sum(tab ? tab.lines : [], (l) => l.total) + sum(tabLinked(s, no), (x) => r2(x.price - (x.paidAmount || 0)));
 }
 function settleTab(s, no, pay, by) {
   const tab = s.tabs[no] || { lines: [] };
   const linked = tabLinked(s, no);
-  const lines = tab.lines.concat(linked.map(specialLine));
+  // Charge only what is still owed on each special. Any deposit was taken when
+  // the order was placed and already has its own receipt.
+  const lines = tab.lines.concat(linked.map((sp) => {
+    const base = specialLine(sp);
+    const owed = r2(sp.price - (sp.paidAmount || 0));
+    return Object.assign({}, base, {
+      name: (sp.paidAmount > 0 ? 'Balance · ' : '') + base.name,
+      total: owed,
+      cost: sp.price ? r2(sp.cost * (owed / sp.price)) : 0,
+      spId: sp.id,
+    });
+  }));
   const sale = createSale(s, { source: 'table', lines, pay, cashier: by, tableNo: no, deduct: false });
+  // The stock for a table's items was taken when they were added to the bill, not
+  // here — but it WAS taken by this sale, so voiding it has to put it back.
+  // Without this the UI's promise that "any stock this sale took out is put back
+  // automatically" silently did not hold for table bills.
+  sale.deducted = true;
   linked.forEach((sp) => { sp.paid = true; sp.paidAmount = sp.price; sp.saleId = sale.id; });
   delete s.tabs[no];
   return sale;
@@ -1028,24 +1070,82 @@ function computePL(s, from, to) {
 // The browser talks to this machine's own local server (see server.js),
 // which is the one writing to SQLite. No internet involved — the server
 // listens on localhost only.
-let _saveTimer = null, _pending = null, _saving = false;
-async function apiLoadState() {
-  const r = await fetch('/api/state');
-  if (!r.ok) throw new Error('Could not load data from the local server (status ' + r.status + ')');
+let _saveTimer = null, _pending = null, _saving = false, _version = null, _token = null;
+
+const setAuthToken = (t) => { _token = t || null; };
+const authHeaders = () => (_token ? { Authorization: 'Bearer ' + _token } : {});
+
+// Just enough to draw the sign-in screen: the business name and who may sign in.
+// Passwords are never sent to the browser.
+async function apiBoot() {
+  const r = await fetch('/api/boot');
+  if (!r.ok) throw new Error('Could not reach the local server (status ' + r.status + ')');
   return await r.json();
 }
+async function apiLogin(username, pass) {
+  const r = await fetch('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, pass }) });
+  if (r.status === 401) { const e = new Error('Wrong username or password.'); e.status = 401; throw e; }
+  if (!r.ok) throw new Error('Sign-in failed (status ' + r.status + ')');
+  const d = await r.json();
+  _token = d.token;
+  return d;
+}
+async function apiLogout() {
+  try { await fetch('/api/logout', { method: 'POST', headers: authHeaders() }); } catch (e) { /* ignore */ }
+  _token = null;
+}
+
+async function apiLoadState() {
+  const r = await fetch('/api/state', { headers: authHeaders() });
+  if (r.status === 401) { const e = new Error('Your session has expired. Please sign in again.'); e.status = 401; throw e; }
+  if (!r.ok) throw new Error('Could not load data from the local server (status ' + r.status + ')');
+  const v = r.headers.get('X-Smartpos-Version');
+  if (v !== null) _version = v;
+  return await r.json();
+}
+
+// After a refused (stale) save, the cashier chooses to pull the server's copy.
+// Their unsaved edit is dropped — the server is the truth, so this is the safe
+// direction, and it can never delete another till's work.
+async function apiReloadAfterConflict() {
+  const data = await apiLoadState();
+  window.__smartposConflict = null;
+  window.__smartposSaveError = false;
+  _pending = null;
+  clearTimeout(_saveTimer);
+  return data;
+}
+
 async function flushSave() {
   if (!_pending || _saving) return;
   const body = _pending; _pending = null; _saving = true;
   try {
-    const r = await fetch('/api/state', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const headers = Object.assign({ 'Content-Type': 'application/json' }, authHeaders());
+    if (_version !== null) headers['X-Smartpos-Expected-Version'] = _version;
+    const r = await fetch('/api/state', { method: 'POST', headers, body: JSON.stringify(body) });
+    if (r.status === 409) {
+      // Another till saved in between, so this copy is out of date. Applying it
+      // would overwrite their sales, so we stop and tell the cashier instead.
+      window.__smartposConflict = { at: Date.now(), serverVersion: r.headers.get('X-Smartpos-Version') };
+      window.__smartposSaveError = true;
+      _pending = body;
+      clearTimeout(_saveTimer);
+      throw new Error('conflict');
+    }
+    if (r.status === 401) { window.__smartposAuthError = true; throw new Error('session expired'); }
     if (!r.ok) throw new Error('save failed: ' + r.status);
+    const v = r.headers.get('X-Smartpos-Version');
+    if (v !== null) _version = v;
+    window.__smartposSaveError = false;
   } catch (e) {
-    console.error('SmartPOS: could not save to the local server', e);
-    window.__smartposSaveError = true;
+    const handled = e && (e.message === 'conflict' || e.message === 'session expired');
+    if (!handled) {
+      console.error('SmartPOS: could not save to the local server', e);
+      window.__smartposSaveError = true;
+    }
   } finally {
     _saving = false;
-    if (_pending) flushSave();
+    if (_pending && !window.__smartposConflict) flushSave();
   }
 }
 function saveState(s) { _pending = s; clearTimeout(_saveTimer); _saveTimer = setTimeout(flushSave, 250); }
@@ -1186,7 +1286,7 @@ function CheckoutModal({ title, total, print, onClose, onConfirm, allowUnpaid, u
 
 /* ---------------- receipt ---------------- */
 const PAY_LABEL = { cash: 'Cash', mpesa: 'M-Pesa', card: 'Card', split: 'Cash + M-Pesa' };
-function ReceiptModal({ sale, auto, onClose }) {
+function ReceiptModal({ sale, auto, opts, onClose }) {
   const { s } = useApp();
   useEffect(() => {
     if (!auto) return undefined;
@@ -1195,6 +1295,10 @@ function ReceiptModal({ sale, auto, onClose }) {
   }, []);
   const st = s.settings;
   const p = sale.pay || {};
+  const o = opts || {};
+  // hideStatus: a ready-made order receipt shows the order and the amount only —
+  // never whether it has been paid. Every other receipt behaves exactly as before.
+  const hide = !!o.hideStatus;
   const src = sale.source === 'table' ? 'Table ' + sale.tableNo : sale.source === 'butchery' ? 'Butchery' : sale.source === 'special' ? 'Special order' : 'Kitchen';
   const sp = sale.special ? s.specials.find((x) => x.id === sale.special) : null;
   return html`<${Modal} title="Receipt" onClose=${onClose} footer=${html`<button className="btn ghost" onClick=${onClose}>Close</button><button className="btn" onClick=${() => { try { window.print(); } catch (e) { /* ignore */ } }}>Print</button>`}>
@@ -1207,17 +1311,19 @@ function ReceiptModal({ sale, auto, onClose }) {
       <div className="ln"><span>Date</span><span>${dateNice(sale.day)} ${timeStr(sale.at)}</span></div>
       <div className="ln"><span>Served by</span><span>${sale.cashier}</span></div>
       <div className="ln"><span>Section</span><span>${src}</span></div>
+      ${o.orderNo ? html`<div className="ln big"><span>Order no.</span><span>#${o.orderNo}</span></div>` : null}
+      ${o.tableNo ? html`<div className="ln big"><span>Table no.</span><span>Table ${o.tableNo}</span></div>` : null}
       ${sale.voided ? html`<div className="ln big"><span>VOIDED</span><span></span></div>` : null}
       <hr />
       ${sale.lines.map((l, i) => html`<div className="ln" key=${i}><span>${l.name}${l.label ? ' · ' + l.label : ''}${l.qty > 1 && (l.kind === 'side' || l.kind === 'drink') ? ' x' + l.qty : ''}</span><span>${Math.round(l.total).toLocaleString('en-US')}</span></div>`)}
       <hr />
       <div className="ln big"><span>TOTAL</span><span>${money(sale.total)}</span></div>
       ${sp ? html`<div className="ln"><span>Order total</span><span>${Math.round(sp.price).toLocaleString('en-US')}</span></div><div className="ln"><span>Paid to date</span><span>${Math.round(sp.paidAmount).toLocaleString('en-US')}</span></div>` : null}
-      <div className="ln"><span>Paid by</span><span>${PAY_LABEL[p.method] || '—'}</span></div>
-      ${p.method === 'cash' && p.tendered ? html`<div className="ln"><span>Cash received</span><span>${Math.round(p.tendered).toLocaleString('en-US')}</span></div><div className="ln"><span>Change</span><span>${Math.round(p.change || 0).toLocaleString('en-US')}</span></div>` : null}
-      ${p.method === 'split' ? html`<div className="ln"><span>Cash</span><span>${Math.round(p.cash).toLocaleString('en-US')}</span></div><div className="ln"><span>M-Pesa</span><span>${Math.round(p.mpesa).toLocaleString('en-US')}</span></div>` : null}
-      ${p.ref ? html`<div className="ln"><span>Ref</span><span>${p.ref}</span></div>` : null}
-      ${sale.status === 'unpaid' && sale.source === 'special' ? html`<div className="ln big"><span>UNPAID</span><span>${money(sale.balance)}</span></div>` : sale.status === 'partial' && sale.source === 'special' ? html`<div className="ln big"><span>BALANCE DUE</span><span>${money(sale.balance)}</span></div>` : sale.source === 'special' ? html`<div className="ln"><span>Status</span><span>PAID IN FULL</span></div>` : null}
+      ${hide ? null : html`<div className="ln"><span>Paid by</span><span>${PAY_LABEL[p.method] || '—'}</span></div>`}
+      ${!hide && p.method === 'cash' && p.tendered ? html`<div className="ln"><span>Cash received</span><span>${Math.round(p.tendered).toLocaleString('en-US')}</span></div><div className="ln"><span>Change</span><span>${Math.round(p.change || 0).toLocaleString('en-US')}</span></div>` : null}
+      ${!hide && p.method === 'split' ? html`<div className="ln"><span>Cash</span><span>${Math.round(p.cash).toLocaleString('en-US')}</span></div><div className="ln"><span>M-Pesa</span><span>${Math.round(p.mpesa).toLocaleString('en-US')}</span></div>` : null}
+      ${!hide && p.ref ? html`<div className="ln"><span>Ref</span><span>${p.ref}</span></div>` : null}
+      ${hide ? null : sale.status === 'unpaid' && sale.source === 'special' ? html`<div className="ln big"><span>UNPAID</span><span>${money(sale.balance)}</span></div>` : sale.status === 'partial' && sale.source === 'special' ? html`<div className="ln big"><span>BALANCE DUE</span><span>${money(sale.balance)}</span></div>` : sale.source === 'special' ? html`<div className="ln"><span>Status</span><span>PAID IN FULL</span></div>` : null}
       <hr />
       <div className="c">${st.footer}</div>
     </div>
@@ -1485,7 +1591,7 @@ function ButcheryPage() {
 function KitchenReady() {
   const { s, update, notify, user, showReceipt } = useApp();
   const [cart, setCart] = useState([]);
-  const [payOpen, setPayOpen] = useState(false);
+  const [tbl, setTbl] = useState('');
   const [modal, setModal] = useState(null);
   const [payFor, setPayFor] = useState(null);
   const reserved = useMemo(() => reservedOf(cart), [cart]);
@@ -1494,22 +1600,27 @@ function KitchenReady() {
   const rm = readyMeats(s);
   const pend = s.requests.filter((r) => r.status === 'pending');
   const unpaid = s.sales.filter((x) => x.source === 'ready' && !x.voided && x.status !== 'paid').sort((a, b) => b.at.localeCompare(a.at));
-  const confirm = (pay, doPrint) => {
+  // Place the order. A receipt prints immediately showing the order and the amount
+  // only — never whether it has been paid — and the order stays open until the
+  // customer pays, at which point the cashier takes payment and it closes.
+  const place = () => {
+    const tableNo = tbl ? Number(tbl) : null;
     const res = update((d) => {
       const err = checkStock(d, cart.flatMap((l) => l.deduct));
       if (err) return { err };
-      return { sale: createSale(d, { source: 'ready', lines: cart, pay, cashier: user.name }) };
+      return { sale: createSale(d, { source: 'ready', lines: cart, pay: null, cashier: user.name, tableNo }) };
     });
     if (res.err) { notify(res.err, 'err'); return; }
-    setCart([]); setPayOpen(false);
-    notify(pay ? 'Sale complete · receipt printing' : 'Recorded as unpaid · receipt printing');
-    showReceipt(res.sale, true);
+    setCart([]);
+    notify('Order placed · receipt printing');
+    // The receipt carries the table number but never whether it has been paid.
+    showReceipt(res.sale, true, { hideStatus: true, tableNo });
   };
   const settle = (pay, doPrint) => {
     const res = update((d) => settleSaleBalance(d, payFor.id, pay, user.name));
     setPayFor(null);
     if (res.err) { notify(res.err, 'err'); return; }
-    notify('Balance cleared for receipt ' + receiptNo(payFor));
+    notify('Paid · ' + receiptNo(payFor) + ' closed');
     if (doPrint) showReceipt(res.sale, true);
   };
   return html`<div>
@@ -1523,23 +1634,24 @@ function KitchenReady() {
       <${ReadyMenu} reserved=${reserved} onAdd=${onAdd} />
       <div className="col" style=${{ gap: '16px' }}>
         <div className="card stick">
-          <div className="card-head"><h3>Walk-in sale</h3>${cart.length ? html`<button className="btn ghost sm" onClick=${() => setCart([])}>Clear</button>` : null}</div>
+          <div className="card-head"><h3>Ready-made order</h3>${cart.length ? html`<button className="btn ghost sm" onClick=${() => setCart([])}>Clear</button>` : null}</div>
+          <${Field} label="Table number" sub="Leave blank for a counter or takeaway customer"><select className="inp" value=${tbl} onChange=${(e) => setTbl(e.target.value)}><option value="">No table</option>${Array.from({ length: s.settings.tables }, (_, i) => html`<option key=${i} value=${i + 1}>Table ${i + 1}</option>`)}</select><//>
           <${CartList} lines=${cart} setLines=${setCart} empty="Tap a portion, side or drink" />
           <div className="total-row"><span className="sec">Total</span><b>${money(total)}</b></div>
-          <p className="hint" style=${{ margin: '6px 0 0' }}>A receipt always prints, whether paid now or left unpaid.</p>
-          <button className="btn lg block mt" disabled=${!cart.length} onClick=${() => setPayOpen(true)}>Take payment</button>
+          <p className="hint" style=${{ margin: '6px 0 0' }}>The receipt prints immediately and shows the order and the amount only — never whether it has been paid. The order stays open here until the customer pays.</p>
+          <button className="btn lg block mt" disabled=${!cart.length} onClick=${place}>Place order & print receipt</button>
         </div>
         ${unpaid.length ? html`<div className="card">
-          <div className="card-head"><h3>Unpaid ready-made <span className="pill warn">${unpaid.length}</span></h3></div>
+          <div className="card-head"><h3>Open orders <span className="pill warn">${unpaid.length}</span></h3></div>
           <div className="col gap-sm">${unpaid.map((x) => html`<div className="row wrap between" key=${x.id}>
-            <div><b>${receiptNo(x)}</b> <span className="muted">${timeStr(x.at)} · ${x.cashier}</span></div>
-            <div className="row"><b className="num-strong">${money(x.balance)}</b><button className="btn good sm" onClick=${() => setPayFor(x)}>Mark paid</button></div>
+            <div><b>${receiptNo(x)}</b> <span className="muted">${timeStr(x.at)} · ${x.cashier}${x.tableNo ? ' · Table ' + x.tableNo : ''}</span></div>
+            <div className="row"><b className="num-strong">${money(x.balance)}</b><button className="btn ghost sm" onClick=${() => showReceipt(x, false, { hideStatus: true, tableNo: x.tableNo })}>Reprint</button><button className="btn good sm" onClick=${() => setPayFor(x)}>Take payment & close</button></div>
           </div>`)}</div>
+          <p className="hint" style=${{ margin: '8px 0 0' }}>Taking payment closes the order and removes it from this list.</p>
         </div>` : null}
       </div>
     </div>
-    ${payOpen ? html`<${CheckoutModal} title="Ready-made payment" total=${total} print="ask" allowUnpaid=${true} unpaidLabel="Leave unpaid & print receipt" onClose=${() => setPayOpen(false)} onConfirm=${confirm} />` : null}
-    ${payFor ? html`<${CheckoutModal} title=${'Clear balance · ' + receiptNo(payFor)} total=${payFor.balance} print="ask" onClose=${() => setPayFor(null)} onConfirm=${settle} />` : null}
+    ${payFor ? html`<${CheckoutModal} title=${'Take payment · ' + receiptNo(payFor)} total=${payFor.balance} print="ask" onClose=${() => setPayFor(null)} onConfirm=${settle} />` : null}
     ${modal ? html`<${KitchenStockModal} type=${modal.type} onClose=${() => setModal(null)} />` : null}
   </div>`;
 }
@@ -1576,6 +1688,24 @@ function KitchenStockModal({ type, onClose }) {
 }
 
 /* ---------------- KITCHEN · specials ---------------- */
+// Build the order receipt for a special. This is a print-only object — it is never
+// saved, so it cannot affect Debtors, Sales or Reports. When a payment has been taken
+// its pay/status/balance are copied across so the receipt shows the deposit position.
+function specialOrderReceipt(sp, sale) {
+  const lines = [Object.assign({}, specialLine(sp))];
+  (sp.sides || []).forEach((x) => lines.push({ name: x.name, label: '', qty: x.qty, unit: 'pc', kind: 'side', total: x.price, cost: 0, deduct: [] }));
+  if (sp.instr) lines.push({ name: '» ' + sp.instr, label: '', qty: 1, unit: 'pc', kind: 'note', total: 0, cost: 0, deduct: [] });
+  const paidAmt = sale ? r2(sale.total - (sale.balance || 0)) : (sp.paidAmount || 0);
+  return {
+    id: 'order-' + sp.id, no: sp.no, day: sp.day, at: sp.at, source: 'special',
+    lines, total: sp.price, cogs: sp.cost,
+    pay: sale ? sale.pay : null,
+    status: paidAmt >= sp.price - 0.5 ? 'paid' : paidAmt > 0 ? 'partial' : 'unpaid',
+    balance: r2(Math.max(0, sp.price - paidAmt)),
+    cashier: sp.by, tableNo: sp.tableNo, special: sp.id, voided: false,
+  };
+}
+
 function SpecialForm({ tableNo, onDone }) {
   const { s, update, notify, user, showReceipt } = useApp();
   const meats = activeMeats(s).filter((x) => x.special > 0);
@@ -1616,19 +1746,21 @@ function SpecialForm({ tableNo, onDone }) {
     });
     if (res.err) { notify(res.err, 'err'); return; }
     setPayOpen(false); reset();
-    notify('Special #' + res.sp.no + ' created · ready by ' + timeStr(res.sp.due));
-    if (res.sale && doPrint) showReceipt(res.sale, true);
+    notify('Special #' + res.sp.no + ' created · receipt printing');
+    // A receipt always prints on creation — paid in full, deposit, pay later, or on a
+    // table — and it always carries the table number and the order number.
+    showReceipt(specialOrderReceipt(res.sp, res.sale), true, { orderNo: res.sp.no, tableNo: res.sp.tableNo });
     if (onDone) onDone(res.sp);
   };
   const submit = () => {
     if (!m) { notify('Pick a meat first', 'err'); return; }
     if (!(qty > 0)) { notify('Choose the quantity', 'err'); return; }
     if (qty > m.stock + 1e-9) { notify('Butchery only has ' + r3(m.stock) + (m.kind === 'bird' ? ' birds' : ' kg') + ' of ' + m.name, 'err'); return; }
-    if (when === 'deposit' && !onTable) {
+    if (when === 'deposit') {
       if (!(depAmt > 0) || depAmt >= price) { notify('Enter a deposit between 0 and the order total', 'err'); return; }
       setPayOpen(true); return;
     }
-    if (when === 'now' && !onTable) { setPayOpen(true); return; }
+    if (when === 'now') { setPayOpen(true); return; }
     create(null, false);
   };
   const qtyChips = m && m.kind === 'bird' ? [[1, 'Full bird'], [0.5, 'Half bird']] : [[0.25, '¼ kg'], [0.5, '½ kg'], [0.75, '¾ kg'], [1, '1 kg'], [1.5, '1½ kg'], [2, '2 kg']];
@@ -1667,17 +1799,17 @@ function SpecialForm({ tableNo, onDone }) {
         <${Field} label="Phone number (optional)"><input className="inp" type="tel" value=${phone} onChange=${(e) => setPhone(e.target.value)} /><//>
         ${tableNo ? null : html`<${Field} label="Table (optional)" sub="If set, the special is added to that table's bill"><select className="inp" value=${tbl} onChange=${(e) => setTbl(e.target.value)}><option value="">No table · walk-in / takeaway</option>${Array.from({ length: s.settings.tables }, (_, i) => html`<option key=${i} value=${i + 1}>Table ${i + 1}</option>`)}</select><//>`}
       </div>
-      ${onTable ? html`<p className="hint mt">This special will be added to Table ${tbl}'s bill and paid when the table settles.</p>` : html`
         <div className="sec-title mt">Payment</div>
-        <div className="chips"><button className=${'chip' + (when === 'later' ? ' on' : '')} onClick=${() => setWhen('later')}>Pay later · mark unpaid</button><button className=${'chip' + (when === 'now' ? ' on' : '')} onClick=${() => setWhen('now')}>Pay in full now</button><button className=${'chip' + (when === 'deposit' ? ' on' : '')} onClick=${() => setWhen('deposit')}>Take a deposit</button></div>
-        ${when === 'deposit' ? html`<div className="mt" style=${{ maxWidth: '220px' }}><${Field} label=${'Deposit amount (' + CUR + ')'} sub=${depAmt > 0 && depAmt < price ? 'Balance after: ' + money(price - depAmt) : ''}><input className="inp num" type="number" inputMode="decimal" value=${deposit} onChange=${(e) => setDeposit(e.target.value)} /><//></div>` : null}`}
+        <div className="chips"><button className=${'chip' + (when === 'later' ? ' on' : '')} onClick=${() => setWhen('later')}>${onTable ? 'Pay at settle · on the table bill' : 'Pay later · mark unpaid'}</button><button className=${'chip' + (when === 'now' ? ' on' : '')} onClick=${() => setWhen('now')}>Pay in full now</button><button className=${'chip' + (when === 'deposit' ? ' on' : '')} onClick=${() => setWhen('deposit')}>Take a deposit</button></div>
+        ${when === 'deposit' ? html`<div className="mt" style=${{ maxWidth: '220px' }}><${Field} label=${'Deposit amount (' + CUR + ')'} sub=${depAmt > 0 && depAmt < price ? 'Balance after: ' + money(price - depAmt) : ''}><input className="inp num" type="number" inputMode="decimal" value=${deposit} onChange=${(e) => setDeposit(e.target.value)} /><//></div>` : null}
+        ${onTable ? html`<p className="hint mt">${when === 'later' ? 'This special goes onto Table ' + tbl + '\'s bill and is paid when the table settles.' : 'Taking money now does not close Table ' + tbl + ' — the rest of the bill still settles as normal, and only the balance left on this order is added to it.'}</p>` : null}
     </div>
     <div className="card row wrap between">
       <div><div className="muted">${m && qty > 0 ? qtyLabel(qty, m.kind === 'bird' ? 'bird' : 'kg') + ' ' + m.name : 'Order total'}${sidesTotal ? ' + sides' : ''}</div><b style=${{ fontSize: '24px' }}>${money(price)}</b></div>
-      <button className="btn lg" onClick=${submit}>${onTable ? 'Add to table bill' : when === 'now' ? 'Take payment & send to kitchen' : when === 'deposit' ? 'Take deposit & send to kitchen' : 'Send to kitchen (unpaid)'}</button>
+      <button className="btn lg" onClick=${submit}>${when === 'now' ? 'Take payment & send to kitchen' : when === 'deposit' ? 'Take deposit & send to kitchen' : onTable ? 'Add to table bill & send to kitchen' : 'Send to kitchen (unpaid)'}</button>
     </div>
     <p className="hint">The exact quantity is taken out of butchery stock as soon as you send the order. Preparation takes about one hour. Every order — paid, deposited or unpaid — gets a receipt showing its status.</p>
-    ${payOpen ? html`<${CheckoutModal} title=${when === 'deposit' ? 'Take deposit' : 'Special order payment'} total=${when === 'deposit' ? depAmt : price} print="ask" onClose=${() => setPayOpen(false)} onConfirm=${create} />` : null}
+    ${payOpen ? html`<${CheckoutModal} title=${when === 'deposit' ? 'Take deposit' : 'Special order payment'} total=${when === 'deposit' ? depAmt : price} print="always" onClose=${() => setPayOpen(false)} onConfirm=${create} />` : null}
   </div>`;
 }
 
@@ -1700,23 +1832,34 @@ function SpecialsRegister() {
   const advance = (sp) => update((d) => { const x = d.specials.find((y) => y.id === sp.id); x.status = NEXT_STATUS[x.status] || x.status; });
   const clear = (sp) => { update((d) => { d.specials.find((y) => y.id === sp.id).cleared = true; }); notify('Order #' + sp.no + ' cleared'); };
   const pay = (p, doPrint) => {
-    const sale = update((d) => paySpecial(d, payFor.id, p, user.name, null));
+    const pf = payFor;
+    const res = update((d) => {
+      const sale = paySpecial(d, pf.id, p, user.name, null);
+      if (!sale) return { err: 'Nothing owing on this order' };
+      const sp = d.specials.find((y) => y.id === pf.id);
+      // Fully settled, so close it. The cashier chose at the payment dialog whether a
+      // final receipt prints — either way the order is cleared.
+      if (sp && sp.paid) sp.cleared = true;
+      return { sale };
+    });
     setPayFor(null);
-    if (sale) { notify('Order #' + payFor.no + ' balance cleared'); if (doPrint) showReceipt(sale, true); }
+    if (res.err) { notify(res.err, 'err'); return; }
+    notify('Order #' + pf.no + ' paid & closed');
+    if (doPrint) showReceipt(res.sale, true, { orderNo: pf.no, tableNo: pf.tableNo });
   };
-  const reprint = (sp) => { const sale = s.sales.find((x) => x.id === sp.saleId); if (sale) showReceipt(sale, false); };
+  const reprint = (sp) => { const sale = s.sales.find((x) => x.id === sp.saleId); if (sale) showReceipt(sale, false, { orderNo: sp.no, tableNo: sp.tableNo }); else notify('Print the order receipt instead — no payment has been recorded on this order yet', 'err'); };
   const counts = { active: s.specials.filter((x) => !x.cleared).length, unpaid: s.specials.filter((x) => !x.paid).length };
   return html`<div>
     <div className="row wrap between mb">
       <${Tabs} value=${filter} onChange=${setFilter} tabs=${[{ id: 'active', label: 'Active', badge: counts.active || null }, { id: 'unpaid', label: 'Unpaid', badge: counts.unpaid || null }, { id: 'cleared', label: 'Cleared' }, { id: 'all', label: 'All' }]} />
       <input className="inp" style=${{ width: '260px', maxWidth: '100%' }} placeholder="Search name, phone, meat, order #" value=${q} onChange=${(e) => setQ(e.target.value)} />
     </div>
-    <p className="hint">Order numbers restart at 1 every day. Once an order is served and paid, clear it from the register.</p>
+    <p className="hint">Order numbers restart at 1 every day, and every special stays here until you clear it, so nothing can go missing. <b>Status</b> is how far the kitchen has got — Pending → Preparing → Ready → Served. <b>Payment</b> is what has been received. <b>Balance</b> is what is still owed. <b>Cleared</b> marks the orders you have finished with. Use <b>Order receipt</b> to reprint a ticket at any time.</p>
     ${list.length ? html`<div className="tbl-wrap"><table className="tbl">
-      <thead><tr><th>Order</th><th>Customer</th><th>Order details</th><th>Table</th><th className="r">Amount</th><th>Status</th><th>Payment</th><th></th></tr></thead>
+      <thead><tr><th>Order</th><th>Customer</th><th>Order details</th><th>Table</th><th className="r">Amount</th><th>Status</th><th>Payment</th><th className="r">Balance</th><th>Cleared</th><th></th></tr></thead>
       <tbody>${list.map((sp) => {
         const overdue = sp.status === 'preparing' && now > new Date(sp.due).getTime();
-        const canClear = sp.status === 'served' && sp.paid && !sp.cleared;
+        const canClear = sp.paid && !sp.cleared;
         return html`<tr key=${sp.id} className=${sp.cleared ? 'dim' : ''}>
           <td><b>#${sp.no}</b><div className="muted" style=${{ fontSize: '11.5px' }}>${sp.day === today ? timeStr(sp.at) : dateNice(sp.day) + ' ' + timeStr(sp.at)}</div></td>
           <td>${sp.customer || html`<span className="muted">—</span>`}<div className="muted" style=${{ fontSize: '11.5px' }}>${sp.phone}</div></td>
@@ -1726,13 +1869,16 @@ function SpecialsRegister() {
           <td>${sp.tableNo ? 'Table ' + sp.tableNo : '—'}</td>
           <td className="r num-strong">${money(sp.price)}${sp.paidAmount > 0 && sp.paidAmount < sp.price ? html`<div className="muted" style=${{ fontSize: '11.5px', fontWeight: 400 }}>paid ${money(sp.paidAmount)}</div>` : null}</td>
           <td>${sp.status === 'served' ? html`<span className="pill ok">Served</span>` : sp.status === 'ready' ? html`<span className="pill info">Ready</span>` : sp.status === 'preparing' ? (overdue ? html`<span className="pill danger">Overdue · was due ${timeStr(sp.due)}</span>` : html`<span className="pill warn">Preparing · ready by ${timeStr(sp.due)}</span>`) : html`<span className="pill">Pending</span>`}</td>
-          <td>${sp.paid ? html`<span className="pill ok">Paid</span>` : sp.paidAmount > 0 ? html`<span className="pill warn">Deposit · ${money(sp.price - sp.paidAmount)} due</span>` : html`<span className="pill danger">Unpaid</span>`}</td>
+          <td>${sp.paid ? html`<span className="pill ok">Paid</span>` : sp.paidAmount > 0 ? html`<span className="pill warn">Part-paid · deposit ${money(sp.paidAmount)}</span>` : html`<span className="pill danger">Unpaid</span>`}</td>
+          <td className="r num-strong">${sp.paid ? html`<span className="muted">—</span>` : money(r2(sp.price - (sp.paidAmount || 0)))}</td>
+          <td>${sp.cleared ? html`<span className="pill ok">Cleared</span>` : html`<span className="muted">Open</span>`}</td>
           <td><div className="row wrap" style=${{ justifyContent: 'flex-end' }}>
             ${sp.status !== 'served' ? html`<button className="btn soft sm" onClick=${() => advance(sp)}>${STATUS_ACTION[sp.status]}</button>` : null}
             ${!sp.paid && !sp.tableNo ? html`<button className="btn good sm" onClick=${() => setPayFor(sp)}>Clear balance</button>` : null}
             ${!sp.paid && sp.tableNo ? html`<span className="muted" style=${{ fontSize: '12px' }}>On Table ${sp.tableNo} bill</span>` : null}
-            ${sp.saleId ? html`<button className="btn ghost sm" onClick=${() => reprint(sp)}>Receipt</button>` : null}
-            ${!sp.cleared ? html`<button className="btn ghost sm" disabled=${!canClear} title=${canClear ? 'Remove from the active register' : 'Available once served and paid'} onClick=${() => clear(sp)}>Clear</button>` : null}
+            <button className="btn ghost sm" onClick=${() => showReceipt(specialOrderReceipt(sp, s.sales.find((x) => x.id === sp.saleId) || null), false, { orderNo: sp.no, tableNo: sp.tableNo })}>Order receipt</button>
+            ${sp.saleId ? html`<button className="btn ghost sm" onClick=${() => reprint(sp)}>Payment receipt</button>` : null}
+            ${!sp.cleared ? html`<button className="btn ghost sm" disabled=${!canClear} title=${canClear ? 'Close this order and remove it from the active register' : 'Available once payment is fully cleared'} onClick=${() => clear(sp)}>Clear</button>` : null}
           </div></td>
         </tr>`;
       })}</tbody></table></div>` : html`<div className="empty">${filter === 'active' ? 'No active special orders. New orders appear here.' : 'Nothing to show for this filter.'}</div>`}
@@ -1742,11 +1888,26 @@ function SpecialsRegister() {
 
 function KitchenPage() {
   const { s } = useApp();
-  const [tab, setTab] = useState('ready');
-  const open = s.specials.filter((x) => !x.cleared && x.status !== 'served').length;
+  // One path only: pick a table, then take the order. There is no separate
+  // counter or takeaway screen — every order happens against a table, so there
+  // is only ever one place for the cashier to look.
+  const [view, setView] = useState('tables');
+  const openSpecials = s.specials.filter((x) => !x.cleared && x.status !== 'served').length;
+  const unpaidSpecials = s.specials.filter((x) => !x.cleared && !x.paid).length;
+  const openTables = Object.keys(s.tabs).length;
+  if (view === 'register') return html`<div>
+    <div className="row wrap between mb">
+      <button className="btn ghost sm" onClick=${() => setView('tables')}>← Back to tables</button>
+      <h3 style=${{ margin: 0 }}>Specials register</h3>
+    </div>
+    <${SpecialsRegister} />
+  </div>`;
   return html`<div>
-    <${Tabs} value=${tab} onChange=${setTab} tabs=${[{ id: 'ready', label: 'Ready-made' }, { id: 'special', label: 'New special' }, { id: 'register', label: 'Specials register', badge: open || null }]} />
-    ${tab === 'ready' ? html`<${KitchenReady} />` : tab === 'special' ? html`<div style=${{ maxWidth: '860px' }}><${SpecialForm} /></div>` : html`<${SpecialsRegister} />`}
+    <div className="row wrap between mb">
+      <p className="hint" style=${{ margin: 0 }}>Tap a table to take its order.${openTables ? ' ' + openTables + (openTables === 1 ? ' table is' : ' tables are') + ' open right now.' : ' No tables open.'}</p>
+      <button className="btn soft sm" onClick=${() => setView('register')}>Specials register${openSpecials ? ' · ' + openSpecials + ' active' : ''}${unpaidSpecials ? ' · ' + unpaidSpecials + ' unpaid' : ''}</button>
+    </div>
+    <${TablesPage} />
   </div>`;
 }
 
@@ -1754,10 +1915,13 @@ function KitchenPage() {
 function TableModal({ no, onClose }) {
   const { s, update, notify, user, showReceipt } = useApp();
   const [payOpen, setPayOpen] = useState(false);
-  const [spOpen, setSpOpen] = useState(false);
+  // The cashier picks a table first, then does everything for that customer from
+  // here: ready-made items, a custom special, and the register that tracks it.
+  const [view, setView] = useState('ready');
   const tab = s.tabs[no] || { lines: [] };
   const linked = tabLinked(s, no);
   const total = tabTotal(s, no);
+  const mine = s.specials.filter((x) => x.tableNo === no && !x.cleared).length;
   const add = (line) => { const r = update((d) => addToTab(d, no, line)); if (r.err) notify(r.err, 'err'); };
   const change = (key, delta) => { const r = update((d) => changeTabLine(d, no, key, delta)); if (r.err) notify(r.err, 'err'); };
   const closeEmpty = () => { update((d) => { delete d.tabs[no]; }); onClose(); };
@@ -1771,7 +1935,16 @@ function TableModal({ no, onClose }) {
   return html`<${Fragment}>
     <${Modal} title=${'Table ' + no} size="wide" onClose=${onClose}>
       <div className="split wide-r">
-        <${ReadyMenu} reserved=${{ meat: {}, cons: {} }} onAdd=${add} />
+        <div className="col" style=${{ gap: '12px' }}>
+          <${Tabs} value=${view} onChange=${setView} tabs=${[
+            { id: 'ready', label: 'Ready-made' },
+            { id: 'special', label: 'Custom special' },
+            { id: 'register', label: 'Special register', badge: mine || null },
+          ]} />
+          ${view === 'ready' ? html`<${ReadyMenu} reserved=${{ meat: {}, cons: {} }} onAdd=${add} />`
+            : view === 'special' ? html`<${SpecialForm} key=${'sp-' + no} tableNo=${no} onDone=${() => setView('register')} />`
+            : html`<${SpecialsRegister} key=${'reg-' + no} />`}
+        </div>
         <div className="card stick">
           <div className="card-head"><h3>Bill · Table ${no}</h3></div>
           ${empty ? html`<div className="empty">Tap items on the left to start this table's bill</div>` : null}
@@ -1781,22 +1954,22 @@ function TableModal({ no, onClose }) {
             <div className="num-strong" style=${{ minWidth: '74px', textAlign: 'right' }}>${money(l.total)}</div>
             <button className="icon-btn" onClick=${() => change(l.key, -9999)} aria-label="Remove">✕</button>
           </div>`)}
-          ${linked.map((sp) => html`<div className="cart-line" key=${sp.id}>
-            <div className="nm"><b>Special #${sp.no} · ${sp.meat}</b><small>${qtyLabel(sp.qty, sp.unit)}${sp.style ? ' · ' + sp.style : ''} · ${sp.status}</small></div>
-            <div className="num-strong" style=${{ minWidth: '74px', textAlign: 'right' }}>${money(sp.price)}</div>
+          ${linked.map((sp) => { const owed = r2(sp.price - (sp.paidAmount || 0)); return html`<div className="cart-line" key=${sp.id}>
+            <div className="nm"><b>Special #${sp.no} · ${sp.meat}</b><small>${qtyLabel(sp.qty, sp.unit)}${sp.style ? ' · ' + sp.style : ''} · ${sp.status}${sp.paidAmount > 0 ? ' · deposit ' + money(sp.paidAmount) + ' taken' : ''}</small></div>
+            <div className="num-strong" style=${{ minWidth: '74px', textAlign: 'right' }}>${money(owed)}</div>
             <span style=${{ width: '30px' }}></span>
-          </div>`)}
+          </div>`; })}
           <div className="total-row"><span className="sec">Total</span><b>${money(total)}</b></div>
           <div className="col mt">
-            <button className="btn soft" onClick=${() => setSpOpen(true)}>Add a special order</button>
+            <button className="btn soft" onClick=${() => setView('special')}>Add a custom special</button>
             <button className="btn lg" disabled=${empty} onClick=${() => setPayOpen(true)}>Settle & pay</button>
+            <button className="btn ghost" onClick=${onClose}>← Back to tables</button>
             ${!linked.length && !tab.lines.length && s.tabs[no] ? html`<button className="btn ghost" onClick=${closeEmpty}>Close empty table</button>` : null}
           </div>
-          <p className="hint" style=${{ margin: '10px 0 0' }}>Receipts print automatically when the table is paid.</p>
+          <p className="hint" style=${{ margin: '10px 0 0' }}>Going back leaves this table open — come back to it any time. The bill prints when the table settles; specials print their own receipt the moment they are ordered.</p>
         </div>
       </div>
     <//>
-    ${spOpen ? html`<${Modal} title=${'Special order · Table ' + no} size="mid" onClose=${() => setSpOpen(false)}><${SpecialForm} tableNo=${no} onDone=${() => setSpOpen(false)} /><//>` : null}
     ${payOpen ? html`<${CheckoutModal} title=${'Pay · Table ' + no} total=${total} print="auto" onClose=${() => setPayOpen(false)} onConfirm=${settle} />` : null}
   <//>`;
 }
@@ -1818,7 +1991,7 @@ function TablesPage() {
     </button>`);
   }
   return html`<div>
-    <p className="hint">Tap a table to build its bill from ready-made meat, sides, drinks and special orders. The bill is paid when the table settles. Change the number of tables in Settings.</p>
+    <p className="hint">Tap a table to open its order — ready-made meat, sides, drinks and special orders all go onto that table's bill, and the bill is paid when the table settles. Change the number of tables in Settings.</p>
     <div className="table-grid">${cards}</div>
     ${open ? html`<${TableModal} no=${open} onClose=${() => setOpen(null)} />` : null}
   </div>`;
@@ -2381,7 +2554,7 @@ function PriceDrinks() {
   const set = (id, k, v) => update((d) => { consOf(d, id)[k] = v; });
   const drinks = s.cons.filter((c) => c.cat === 'drink');
   return html`<div>
-    <p className="hint">Drinks sold at the kitchen counter and on tables. Stock is tracked under Consumables and comes off automatically when a drink is sold.</p>
+    <p className="hint">Drinks sold on tables. Stock is tracked under Consumables and comes off automatically when a drink is sold.</p>
     <div className="tbl-wrap"><table className="tbl">
       <thead><tr><th>Drink</th><th>Unit</th><th className="r">Price (${CUR})</th><th className="r">Buying cost (${CUR})</th><th className="r">Low-stock alert</th><th></th></tr></thead>
       <tbody>${drinks.map((c) => html`<tr key=${c.id}>
@@ -2505,11 +2678,11 @@ function ReportsPage() {
 /* ---------------- USER MANUAL ---------------- */
 function ManualPage() {
   const sections = [
-    ['Signing in', 'Use the username and password an admin gave you. Admins see everything, including Dashboard and Reports. Cashiers see every other section — Butchery, Tables, Kitchen, Inventory, Sales, Debtors, Expenses, Salaries & Advances, Suppliers and Cash & Bank — but never Dashboard or Reports, never Rent expenses, and never the salaries of monthly-paid staff.'],
+    ['Signing in', 'Use the username and password an admin gave you. Signing in is checked by the server, which then issues this browser a session token; until you sign in, no shop data is sent to the screen at all. Admins see everything, including Dashboard and Reports. Cashiers see every other section — Kitchen, Butchery, Inventory, Sales, Debtors, Expenses, Salaries & Advances, Suppliers and Cash & Bank — but never Dashboard or Reports, never Rent expenses, and never the salaries of monthly-paid staff.'],
     ['Butchery', 'Sell raw meat by the quarter, half, three-quarter or full kilogram, by a custom weight, or by how much the customer wants to spend. Chicken sells as a full or half bird. A customer can also be sold to "on credit" — the meat leaves stock now, they pay later, and it shows up under Debtors until cleared.'],
     ['Kitchen — Ready-made', 'Pre-cooked meat sold by the portion, plus sides and drinks, for walk-in customers. A receipt always prints, whether paid or left unpaid. If the kitchen runs low, use "Request meat from butchery" — you can still keep selling while you wait.'],
     ['Kitchen — Specials', 'Made-to-order meat with a cooking style, sides (tap a side to add it, tap again for more) and instructions (tap to select — no typing needed). The customer can pay in full, leave a deposit, or pay later, tracked through Pending → Preparing → Ready → Served in the Specials register.'],
-    ['Tables', 'Build up a table\'s bill from ready-made meat, sides, drinks and specials, then settle it all at once when the customer is ready to pay.'],
+    ['Tables', 'Kitchen opens here. Tap a table to open its order — ready-made meat, sides, drinks and specials all go onto that table\'s bill, and the bill is paid when the table settles. Every order belongs to a table.'],
     ['Inventory Management', 'Five views: Ready-made stock (portions, converted automatically from kg transferred out of the butchery), Meat & butchery (raw stock, receiving, waste, kitchen requests), Drinks (sold to customers), Kitchen ingredients (maize flour, cooking oil — used to prepare food, so they count toward food cost), Consumables (non-food supplies like serviettes, straws and takeaway packaging), and a Movement ledger showing every purchase, transfer, sale, wastage and stock-count adjustment in one place.'],
     ['Sales, Debtors & Voids', 'Every receipt is listed under Sales. Anyone who currently owes money — a Butchery credit customer or an unpaid/deposit special order — is listed under Debtors, with a button to clear their balance. If something was rung up in error, void it and give a reason — the stock it used is put back automatically, and the void is recorded in the Audit Trail.'],
     ['Suppliers & Cash & Bank', 'Suppliers tracks what you owe for stock bought on credit. Cash & Bank reconciles both cash and M-Pesa for the day — expected takings versus what was actually counted or shown on the M-Pesa statement — and records cash banked or M-Pesa withdrawn.'],
@@ -2641,7 +2814,7 @@ function SettingsPage() {
         <${Field} label="Password"><input className="inp" value=${nu.pass} onChange=${(e) => setNu(Object.assign({}, nu, { pass: e.target.value }))} /><//>
         <${Field} label="Role"><select className="inp" value=${nu.role} onChange=${(e) => setNu(Object.assign({}, nu, { role: e.target.value }))}><option value="cashier">Cashier</option><option value="admin">Admin</option></select><//>
       </div><div className="mt"><button className="btn" onClick=${addUser}>Add user</button></div></div>
-      <p className="hint">Sign-in here is a convenience for a shared till, not strong security: the data stays in this browser and passwords are stored as plain text.</p>
+      <p className="hint">Sign-in is checked by the server, and no shop data is sent to this screen until you have signed in successfully. Note that passwords are still stored as plain text inside the database file, so keep that file private and backed up.</p>
     </div>` : null}
     ${tab === 'backup' ? html`<div className="col" style=${{ maxWidth: '860px', gap: '16px' }}>
       <div className="alert"><span>💾</span><div>All data lives in this browser on this device. Copy a backup regularly, especially before clearing browser data or changing devices.</div></div>
@@ -2657,10 +2830,13 @@ function Login({ users, name, onLogin }) {
   const [u, setU] = useState('');
   const [p, setP] = useState('');
   const [err, setErr] = useState('');
-  const submit = () => {
-    const f = users.find((x) => x.username.toLowerCase() === u.trim().toLowerCase() && x.pass === p);
-    if (!f) { setErr('Wrong username or password.'); return; }
-    onLogin(f);
+  const [busy, setBusy] = useState(false);
+  // The server checks the password against the real accounts and returns a
+  // session token. The browser never holds a password list to compare against.
+  const submit = async () => {
+    if (busy) return;
+    setErr(''); setBusy(true);
+    try { await onLogin(u.trim(), p); } catch (e) { setErr((e && e.message) || 'Sign-in failed.'); setBusy(false); }
   };
   const key = (e) => { if (e.key === 'Enter') submit(); };
   return html`<div className="login-wrap"><div className="login-card">
@@ -2669,14 +2845,14 @@ function Login({ users, name, onLogin }) {
     <${Field} label="Username"><input className="inp" value=${u} onChange=${(e) => { setU(e.target.value); setErr(''); }} onKeyDown=${key} autoFocus autoCapitalize="none" /><//>
     <${Field} label="Password"><input className="inp" type="password" value=${p} onChange=${(e) => { setP(e.target.value); setErr(''); }} onKeyDown=${key} /><//>
     ${err ? html`<div className="err-msg">${err}</div>` : null}
-    <button className="btn lg block" onClick=${submit}>Sign in</button>
+    <button className="btn lg block" disabled=${busy} onClick=${submit}>${busy ? 'Signing in…' : 'Sign in'}</button>
   </div></div>`;
 }
 
 /* ---------------- APP SHELL ---------------- */
 const NAV = [
   { sec: 'Overview', items: [{ id: 'dashboard', label: 'Dashboard', icon: '📊', admin: true }] },
-  { sec: 'Operations', items: [{ id: 'tables', label: 'Tables', icon: '🍽️' }, { id: 'butchery', label: 'Butchery', icon: '🥩' }, { id: 'kitchen', label: 'Kitchen', icon: '🍖' }] },
+  { sec: 'Operations', items: [{ id: 'kitchen', label: 'Kitchen', icon: '🍖' }, { id: 'butchery', label: 'Butchery', icon: '🥩' }] },
   { sec: 'Stock', items: [{ id: 'inventory', label: 'Inventory Management', icon: '📋' }] },
   { sec: 'Finance', items: [{ id: 'sales', label: 'Sales', icon: '🧾' }, { id: 'debtors', label: 'Debtors', icon: '🧾' }, { id: 'expenses', label: 'Expenses', icon: '💸' }, { id: 'employees', label: 'Salaries & Advances', icon: '👷' }, { id: 'suppliers', label: 'Suppliers', icon: '🚚' }, { id: 'cashbank', label: 'Cash & Bank', icon: '🏦' }, { id: 'reports', label: 'Reports', icon: '📈', admin: true }] },
   { sec: 'Management', items: [{ id: 'audit', label: 'Audit Trail', icon: '🛡️' }, { id: 'settings', label: 'Settings', icon: '⚙️', admin: true }, { id: 'manual', label: 'User Manual', icon: '📘' }] },
@@ -2925,22 +3101,59 @@ function CashBankPage() {
   </div>`;
 }
 
+const sessionToken = () => { try { return sessionStorage.getItem('mh_token'); } catch (e) { return null; } };
+const storeSession = (token, user) => { try { sessionStorage.setItem('mh_token', token); sessionStorage.setItem('mh_user', JSON.stringify(user)); } catch (e) { /* ignore */ } };
+const clearSession = () => { try { sessionStorage.removeItem('mh_token'); sessionStorage.removeItem('mh_user'); } catch (e) { /* ignore */ } };
+
+// Boot order matters: fetch only the public sign-in list first, sign in, and
+// only then download the shop's data. Before this, the browser downloaded
+// everything — including every password — before anyone had signed in.
 function AppLoader() {
-  const [state, setState] = useState({ status: 'loading', data: null, err: null });
+  const [phase, setPhase] = useState('boot');
+  const [boot, setBoot] = useState(null);
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState(null);
+
+  const load = useCallback(async () => {
+    setPhase('loading');
+    try {
+      const d = await apiLoadState();
+      setData(d); setErr(null); setPhase('ready');
+    } catch (e) {
+      if (e && e.status === 401) { clearSession(); setAuthToken(null); setPhase('login'); }
+      else { setErr(e); setPhase('error'); }
+    }
+  }, []);
+
   useEffect(() => {
     let alive = true;
-    apiLoadState().then((data) => { if (alive) setState({ status: 'ready', data, err: null }); })
-      .catch((e) => { if (alive) setState({ status: 'error', data: null, err: e }); });
+    apiBoot()
+      .then((b) => {
+        if (!alive) return;
+        setBoot(b);
+        const t = sessionToken();
+        if (t) { setAuthToken(t); return load(); }
+        setPhase('login');
+      })
+      .catch((e) => { if (alive) { setErr(e); setPhase('error'); } });
     return () => { alive = false; };
   }, []);
-  if (state.status === 'loading') return html`<div className="login-wrap"><div className="login-card center"><div className="logo">🐖</div><p>Connecting to the local server…</p></div></div>`;
-  if (state.status === 'error') return html`<div className="login-wrap"><div className="login-card">
+
+  const doLogin = async (username, pass) => {
+    const d = await apiLogin(username, pass);
+    storeSession(d.token, d.user);
+    await load();
+  };
+
+  if (phase === 'boot' || phase === 'loading') return html`<div className="login-wrap"><div className="login-card center"><div className="logo">🐖</div><p>${phase === 'boot' ? 'Connecting to the local server…' : 'Loading your data…'}</p></div></div>`;
+  if (phase === 'error') return html`<div className="login-wrap"><div className="login-card">
     <div className="logo">⚠️</div>
     <h2>Can't reach the local server</h2>
     <p>Make sure the SmartPOS server is running (open a terminal in the project folder and run <code>node server.js</code>), then reload this page.</p>
     <button className="btn lg block" onClick=${() => window.location.reload()}>Try again</button>
   </div></div>`;
-  return html`<${App} initial=${state.data} />`;
+  if (phase === 'login') return html`<${Login} users=${boot ? boot.users : []} name=${boot ? boot.business : 'SmartPOS'} onLogin=${doLogin} />`;
+  return html`<${App} initial=${data} />`;
 }
 function GlobalSearch({ isAdmin }) {
   const { s, go } = useApp();
@@ -2973,12 +3186,24 @@ function App({ initial }) {
   const [confirmBox, setConfirmBox] = useState(null);
   const [toast, setToast] = useState(null);
   const [navOpen, setNavOpen] = useState(false);
+  const [conflict, setConflict] = useState(null);
+  // Watch for a refused save. The server refuses one when another screen saved
+  // first, which is how we avoid silently deleting that screen's sales.
+  useEffect(() => {
+    const id = setInterval(() => {
+      const c = window.__smartposConflict;
+      setConflict((cur) => (c && (!cur || cur.at !== c.at) ? c : cur));
+    }, 1500);
+    return () => clearInterval(id);
+  }, []);
   CUR = s.settings.currency || 'KSh';
 
   const update = useCallback((fn) => { const next = clone(ref.current); const res = fn(next); ref.current = next; setS(next); saveState(next); return res; }, []);
   const replaceAll = useCallback((next) => { ref.current = next; setS(next); saveState(next); flushSave(); }, []);
   const notify = useCallback((msg, kind) => { setToast({ msg, kind: kind || 'ok', id: Date.now() }); if (ref.current.settings.sounds !== false) (kind === 'err' ? SOUND.err : SOUND.ok)(); }, []);
-  const showReceipt = useCallback((sale, auto) => setReceipt({ sale, auto: !!auto, id: Date.now() }), []);
+  // opts is optional and additive: { hideStatus, orderNo, tableNo, kind }.
+  // Existing callers pass only (sale, auto) and are unaffected.
+  const showReceipt = useCallback((sale, auto, opts) => setReceipt({ sale, auto: !!auto, opts: opts || null, id: Date.now() }), []);
   const ask = useCallback((title, msg, onYes, danger) => setConfirmBox({ title, msg, onYes, danger }), []);
   const requestMore = useCallback((meatId, qty) => {
     const u = user;
@@ -3003,15 +3228,22 @@ function App({ initial }) {
     return () => { clearInterval(t); window.removeEventListener('pagehide', onHide); document.removeEventListener('visibilitychange', onHide); };
   }, []);
 
-  const login = (u) => { try { sessionStorage.setItem('mh_user', JSON.stringify(u)); } catch (e) { /* ignore */ } setUser(u); setPage(null); };
-  const logout = () => { try { sessionStorage.removeItem('mh_user'); } catch (e) { /* ignore */ } setUser(null); setPage(null); };
+  const logout = () => { apiLogout(); clearSession(); setAuthToken(null); flushSave(); window.location.reload(); };
+  const resolveConflict = async () => {
+    try {
+      const d = await apiReloadAfterConflict();
+      replaceAll(d);
+      setConflict(null);
+      notify('Latest data loaded · carry on where you left off');
+    } catch (e) { notify('Could not reload — check the server is running', 'err'); }
+  };
   const ctx = { s, update, replaceAll, notify, user, showReceipt, ask, requestMore, go: (p) => { setPage(p); setNavOpen(false); } };
 
-  if (!user) return html`<${Login} users=${s.users} name=${s.settings.business} onLogin=${login} />`;
+  if (!user) { setTimeout(() => window.location.reload(), 0); return html`<div className="login-wrap"><div className="login-card center"><div className="logo">🐖</div><p>Returning to sign-in…</p></div></div>`; }
   const live = s.users.find((x) => x.id === user.id) || user;
   if (live.role === 'admin' && !s.settings.setupDone) return html`<${Ctx.Provider} value=${ctx}><${SetupWizard} onDone=${() => setPage(null)} /><//>`;
   const isAdmin = live.role === 'admin';
-  const cur = page && PAGES[page] && (isAdmin || !(NAV.some((g) => g.items.some((i) => i.id === page && i.admin)))) ? page : (isAdmin ? 'dashboard' : 'tables');
+  const cur = page && PAGES[page] && (isAdmin || !(NAV.some((g) => g.items.some((i) => i.id === page && i.admin)))) ? page : (isAdmin ? 'dashboard' : 'kitchen');
   const Page = PAGES[cur];
   const badges = { inventory: consLow(s).length + meatLow(s).length + readyLowMeats(s).length, kitchen: s.specials.filter((x) => !x.cleared && x.status !== 'served').length, debtors: debtors(s).length };
   const themes = ['dark', 'light', 'warm', 'auto'];
@@ -3020,6 +3252,11 @@ function App({ initial }) {
 
   return html`<${Ctx.Provider} value=${ctx2}>
     <div className=${'app' + (navOpen ? ' nav-open' : '')}>
+      ${conflict ? html`<div style=${{ position: 'fixed', top: 0, left: 0, right: 0, zIndex: 9999, background: 'var(--t-danger)', color: '#fff', padding: '14px 18px', display: 'flex', gap: '14px', alignItems: 'center', flexWrap: 'wrap', boxShadow: '0 6px 24px #00000066' }}>
+        <b>Data changed elsewhere</b>
+        <span style=${{ flex: 1, minWidth: '240px' }}>Another screen saved changes while you were working, so this screen's copy is out of date. Nothing has been deleted, but your last change was not saved. Load the latest data to carry on.</span>
+        <button className="btn sm" style=${{ background: '#fff', color: '#1b1c26' }} onClick=${resolveConflict}>Load latest data</button>
+      </div>` : null}
       <aside className="sidebar">
         <div className="brand"><div className="logo">🐖</div><div><b>${s.settings.business}</b><small>SmartPOS v2</small></div></div>
         <nav className="nav">${NAV.map((g) => {
@@ -3042,7 +3279,7 @@ function App({ initial }) {
         <main className="content"><${Page} key=${cur} /></main>
       </div>
     </div>
-    ${receipt ? html`<${ReceiptModal} key=${receipt.id} sale=${receipt.sale} auto=${receipt.auto} onClose=${() => setReceipt(null)} />` : null}
+    ${receipt ? html`<${ReceiptModal} key=${receipt.id} sale=${receipt.sale} auto=${receipt.auto} opts=${receipt.opts} onClose=${() => setReceipt(null)} />` : null}
     ${confirmBox ? html`<${Modal} title=${confirmBox.title} onClose=${() => setConfirmBox(null)} footer=${html`<button className="btn ghost" onClick=${() => setConfirmBox(null)}>Cancel</button><button className=${'btn' + (confirmBox.danger ? ' warn' : '')} onClick=${() => { const f = confirmBox.onYes; setConfirmBox(null); f(); }}>Confirm</button>`}><p>${confirmBox.msg}</p><//>` : null}
     ${toast ? html`<div className=${'toast' + (toast.kind === 'err' ? ' err' : '')} role="status" key=${toast.id}>${toast.msg}</div>` : null}
   <//>`;

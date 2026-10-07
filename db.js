@@ -43,6 +43,21 @@ function openDb(file) {
   return db;
 }
 
+/* ---------------- save version ---------------- */
+// A single persisted counter, used to detect a stale save. It lives in the
+// singletons table under a key that is deliberately NOT in SINGLETON_KEYS, so
+// loadState and saveState never read or overwrite it.
+const VERSION_KEY = '__version';
+function getVersion(db) {
+  const row = db.prepare('SELECT data FROM singletons WHERE key = ?').get(VERSION_KEY);
+  if (!row) return 0;
+  try { const v = JSON.parse(row.data); return Number(v.version) || 0; } catch (e) { return 0; }
+}
+function setVersion(db, v) {
+  db.prepare('INSERT INTO singletons (key, data, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at')
+    .run(VERSION_KEY, JSON.stringify({ version: v }), new Date().toISOString());
+}
+
 // Load the whole app state (same shape logic.js's seed() produces) out of SQLite.
 function loadState(db, seedFn) {
   const seeded = seedFn();
@@ -137,4 +152,4 @@ function saveState(db, state) {
   return now;
 }
 
-module.exports = { openDb, loadState, saveState, backfillPortionPrices, RECORD_COLLECTIONS, SINGLETON_KEYS };
+module.exports = { openDb, loadState, saveState, backfillPortionPrices, getVersion, setVersion, RECORD_COLLECTIONS, SINGLETON_KEYS };

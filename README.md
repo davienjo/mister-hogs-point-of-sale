@@ -81,13 +81,34 @@ without touching the database file directly.
 
 ## One computer, one till
 
-Right now this is built for one computer running the server, with staff
-using the browser on that same machine. Because it's a real local server,
-if you later want a second till in the same shop talking to the same data,
-the plumbing (`server.js` and `db.js`) already supports it — you'd just point
-a second computer's browser at `http://<the till's network address>:4173`
-instead of `localhost`, and open the port on that computer's firewall. Ask
-if you'd like help setting that up.
+This is built for one computer running the server, with the cashier using the
+browser on that same machine.
+
+A second till *can* point at `http://<the till's network address>:4173`, but
+understand what happens if you do. Both screens hold their own copy of the
+data, and each save replaces what is on the server. To stop the second screen
+from silently deleting the first screen's sales, the server refuses any save
+built on out-of-date data (HTTP 409). The screen shows a red banner — **"Data
+changed elsewhere"** — with a **Load latest data** button. Nothing is deleted,
+but whatever that screen had not yet saved is dropped when it reloads.
+
+So a second till is safe, not seamless. If you genuinely need two tills taking
+sales at the same time, the proper fix is per-record saving on the server
+rather than whole-state saving. Ask and this can be done.
+
+**Do not open port 4173 to the internet.** It is meant for your shop's local
+network only.
+
+## Signing in
+
+The browser first asks the server for nothing but the business name and the
+list of usernames. You sign in, the server checks the password against the
+real accounts and returns a session token, and only then is any shop data
+sent. Sign-out, or closing the tab, ends the session; a session also expires
+after 12 hours.
+
+Passwords are still stored as plain text inside `data/smartpos.db`. That file
+is the whole business, so keep it backed up and do not share it.
 
 ## About the one online dependency
 
@@ -101,11 +122,27 @@ can be set up.
 ## Project layout
 
 ```
-server.js        the server (Node's built-in http + SQLite, no dependencies)
+server.js        the server (Node's built-in http, SQLite and crypto — no dependencies)
 db.js            reads and writes data/smartpos.db
 logic-seed.js    the starting sample data for a brand-new database
-public/index.html   the app itself (what your browser loads)
+src/             the SOURCE of the app — edit these files, never public/index.html
+  logic.js         business rules (no DOM, no React) and the server sync layer
+  ui1.js           shared components: modal, checkout, receipt
+  ui2.js           Operations: Butchery, Kitchen, ready-made, specials, tables
+  ui3.js           the rest of the screens, navigation and the app shell
+  style.tpl.css    styles, with the three theme palettes injected at build time
+  htm.core.js      the small tagged-template compiler
+build.py         combines src/ into public/index.html — run after editing src/
+public/index.html   GENERATED. Never edit this by hand; build.py overwrites it
 data/            created automatically — smartpos.db lives here
+tests/           behaviour tests, run with: node tests/operations.test.js
+```
+
+After changing anything in `src/`, rebuild and restart:
+
+```
+python build.py
+node server.js
 ```
 
 Built for Mister Hogs.
